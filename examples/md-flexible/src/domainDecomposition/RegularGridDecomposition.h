@@ -135,8 +135,8 @@ class RegularGridDecomposition final : public DomainDecomposition {
    * @param autoPasContainer: The container, where the migrating particles originate from.
    * @param PPL: Particle Properties Library (needed to get particle's sigma)
    */
+  void reflectParticlesAtBoundaries1(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
   void reflectParticlesAtBoundaries(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
-
   /**
    * Getter for the communicator that encompasses the whole decomposition.
    * @return

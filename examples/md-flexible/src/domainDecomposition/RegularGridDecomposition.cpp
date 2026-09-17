@@ -300,7 +300,7 @@ void RegularGridDecomposition::exchangeMigratingParticles(AutoPasType &autoPasCo
   }
 }
 
-void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPasContainer,
+void RegularGridDecomposition::reflectParticlesAtBoundaries1(AutoPasType &autoPasContainer,
                                                             ParticlePropertiesLibraryType &particlePropertiesLib) {
   using autopas::utils::Math::isNearRel;
   std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
@@ -415,6 +415,151 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
             auto returnedPosition = position;
             returnedPosition[dimensionIndex] += 2 * displacementToBoundary;
             return returnedPosition;
+          }();
+          const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
+          const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
+          const auto force = LJKernel(position, mirrorPosition, sigmaSquared, epsilon24);
+          p->addF(force);
+#endif
+
+#if MD_FLEXIBLE_MODE == MULTISITE
+          // test if attraction has occurred
+          const bool reflectionIsAttractive = isUpper ? p->getF()[dimensionIndex] - currentForce[dimensionIndex] > 0
+                                                      : p->getF()[dimensionIndex] - currentForce[dimensionIndex] < 0;
+          // reset force if no attraction has occurred
+          if (reflectionIsAttractive) {
+            p->setF(currentForce);
+            p->setTorque(currentTorque);
+          }
+#endif
+        }
+      }
+    };
+
+    // apply if we are at a global boundary on lower end of the dimension
+    if (isNearRel(_localBoxMin[dimensionIndex], _globalBoxMin[dimensionIndex])) {
+      reflSkinMin = _globalBoxMin;
+      reflSkinMax = _globalBoxMax;
+      reflSkinMax[dimensionIndex] = _globalBoxMin[dimensionIndex] + _maxReflectiveSkin;
+
+      reflect(false);
+    }
+    // apply if we are at a global boundary on upper end of the dimension
+    if (isNearRel(_localBoxMax[dimensionIndex], _globalBoxMax[dimensionIndex])) {
+      reflSkinMin = _globalBoxMin;
+      reflSkinMax = _globalBoxMax;
+      reflSkinMin[dimensionIndex] = _globalBoxMax[dimensionIndex] - _maxReflectiveSkin;
+
+      reflect(true);
+    }
+  }
+}
+
+void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPasContainer,
+                                                            ParticlePropertiesLibraryType &particlePropertiesLib) {
+  using autopas::utils::Math::isNearRel;
+  std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
+
+  for (int dimensionIndex = 0; dimensionIndex < _dimensionCount; ++dimensionIndex) {
+    // skip if boundary is not reflective
+    if (_boundaryType[dimensionIndex] != options::BoundaryTypeOption::reflective) continue;
+
+    auto reflect = [&](bool isUpper) {
+      double amplitude = 1.0;
+      double frequency = 3.5;
+      //const auto boundaryPosition = amplitude * (1.0 + std::sin(2.0 * M_PI * frequency));
+      const auto boundaryPosition = isUpper ? reflSkinMax[dimensionIndex] : reflSkinMin[dimensionIndex];
+
+      for (auto p = autoPasContainer.getRegionIterator(reflSkinMin, reflSkinMax, autopas::IteratorBehavior::owned);
+           p.isValid(); ++p) {
+        // Check that particle is within 6th root of 2 * sigma
+        const auto position = p->getR();
+        const auto distanceToBoundary = std::abs(position[dimensionIndex] - boundaryPosition);
+
+        // Calculates force acting on site from another site
+        const auto LJKernel = [](const std::array<double, 3> sitePosition,
+                                 const std::array<double, 3> mirrorSitePosition, const double sigmaSquared,
+                                 const double epsilon24) {
+          const auto displacement = autopas::utils::ArrayMath::sub(sitePosition, mirrorSitePosition);
+          const auto distanceSquared = autopas::utils::ArrayMath::dot(displacement, displacement);
+
+          const auto inverseDistanceSquared = 1. / distanceSquared;
+          const auto lj2 = sigmaSquared * inverseDistanceSquared;
+          const auto lj6 = lj2 * lj2 * lj2;
+          const auto lj12 = lj6 * lj6;
+          const auto lj12m6 = lj12 - lj6;
+          const auto scalarMultiple = epsilon24 * (lj12 + lj12m6) * inverseDistanceSquared;
+
+          return autopas::utils::ArrayMath::mulScalar(displacement, scalarMultiple);
+        };
+
+        const bool reflectMoleculeFlag =
+            distanceToBoundary < sixthRootOfTwo * 0.5 *
+#if MD_FLEXIBLE_MODE == MULTISITE
+                                     particlePropertiesLib.getMoleculesLargestSigma(p->getTypeId());
+#else
+                                     particlePropertiesLib.getSigma(p->getTypeId());
+#endif
+
+        if (reflectMoleculeFlag) {
+#if MD_FLEXIBLE_MODE == MULTISITE
+          // Keep track of current force and torque to see if molecule is repulsed, and, if not, reset the force.
+          const auto currentForce = p->getF();
+          const auto currentTorque = p->getTorque();
+
+          // load site positions and types
+          const auto unrotatedSitePositions = particlePropertiesLib.getSitePositions(p->getTypeId());
+          const auto rotatedSitePositions =
+              autopas::utils::quaternion::rotateVectorOfPositions(p->getQuaternion(), unrotatedSitePositions);
+          const auto exactSitePositions = [rotatedSitePositions, position]() {
+            std::vector<std::array<double, 3>> returnedPositions{};
+            returnedPositions.reserve(rotatedSitePositions.size());
+            for (const auto &rotatedSitePosition : rotatedSitePositions) {
+              returnedPositions.push_back(autopas::utils::ArrayMath::add(rotatedSitePosition, position));
+            }
+            return returnedPositions;
+          }();
+          const auto siteTypes = particlePropertiesLib.getSiteTypes(p->getTypeId());
+
+          // get positions of opposing mirror sites
+          const auto exactMirrorSitePositions = [exactSitePositions, boundaryPosition, dimensionIndex]() {
+            std::vector<std::array<double, 3>> returnedPositions{};
+            returnedPositions.reserve(exactSitePositions.size());
+            for (const auto &exactSitePosition : exactSitePositions) {
+              auto mirrorPosition = exactSitePosition;
+              const auto displacementToBoundary = boundaryPosition - exactSitePosition[dimensionIndex];
+              mirrorPosition[dimensionIndex] += 2 * displacementToBoundary;
+              returnedPositions.push_back(mirrorPosition);
+            }
+            return returnedPositions;
+          }();
+
+          // Add forces + torques for molecule-to-molecule interaction
+          for (int site = 0; site < particlePropertiesLib.getNumSites(p->getTypeId()); site++) {
+            for (int mirrorSite = 0; mirrorSite < particlePropertiesLib.getNumSites(p->getTypeId()); mirrorSite++) {
+              const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteTypes[site], siteTypes[site]);
+              const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteTypes[site], siteTypes[site]);
+              const auto force =
+                  LJKernel(exactSitePositions[site], exactMirrorSitePositions[mirrorSite], sigmaSquared, epsilon24);
+              p->addF(force);
+              p->addTorque((autopas::utils::ArrayMath::cross(rotatedSitePositions[site], force)));
+            }
+          }
+#else
+          const auto siteType = p->getTypeId();
+          const auto mirrorPosition = [position, boundaryPosition, dimensionIndex, isUpper]() {
+            if (dimensionIndex == 2 && !isUpper)
+            {
+              auto returnedPosition = position;
+              returnedPosition[dimensionIndex] = boundaryPosition;
+              return returnedPosition;
+            } else
+            {
+              const auto displacementToBoundary = boundaryPosition - position[dimensionIndex];
+              auto returnedPosition = position;
+              returnedPosition[dimensionIndex] += 2 * displacementToBoundary;
+              return returnedPosition;
+            }
           }();
           const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
           const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
