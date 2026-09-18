@@ -460,23 +460,33 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
   using autopas::utils::Math::isNearRel;
   std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
 
+  double Amplitude = 1.0;
+  int freq = 2;
+  double wave_x_position = 2.0 * M_PI * freq / (_globalBoxMax[0] - _globalBoxMin[0]);
+
   for (int dimensionIndex = 0; dimensionIndex < _dimensionCount; ++dimensionIndex) {
-    // skip if boundary is not reflective
     if (_boundaryType[dimensionIndex] != options::BoundaryTypeOption::reflective) continue;
 
     auto reflect = [&](bool isUpper) {
-      double amplitude = 1.0;
-      double frequency = 3.5;
-      //const auto boundaryPosition = amplitude * (1.0 + std::sin(2.0 * M_PI * frequency));
-      const auto boundaryPosition = isUpper ? reflSkinMax[dimensionIndex] : reflSkinMin[dimensionIndex];
+//      bool isSineWall = false;
+      bool isSineWall = (dimensionIndex == 2) and not isUpper;
+      const double flatBoundaryPosition = isUpper ? reflSkinMax[dimensionIndex] : reflSkinMin[dimensionIndex];
 
       for (auto p = autoPasContainer.getRegionIterator(reflSkinMin, reflSkinMax, autopas::IteratorBehavior::owned);
            p.isValid(); ++p) {
-        // Check that particle is within 6th root of 2 * sigma
         const auto position = p->getR();
+
+        //////
+        if (isSineWall)
+        {
+
+        }
+        const auto boundaryPosition =
+            isSineWall ? _globalBoxMin[dimensionIndex] + Amplitude * (1.0 + std::sin(wave_x_position * position[0]))
+                       : flatBoundaryPosition;
+
         const auto distanceToBoundary = std::abs(position[dimensionIndex] - boundaryPosition);
 
-        // Calculates force acting on site from another site
         const auto LJKernel = [](const std::array<double, 3> sitePosition,
                                  const std::array<double, 3> mirrorSitePosition, const double sigmaSquared,
                                  const double epsilon24) {
@@ -548,26 +558,25 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
 #else
           const auto siteType = p->getTypeId();
           const auto mirrorPosition = [position, boundaryPosition, dimensionIndex, isUpper]() {
-            if (dimensionIndex == 2 && !isUpper)
-            {
-              auto returnedPosition = position;
-              returnedPosition[dimensionIndex] = boundaryPosition;
-              return returnedPosition;
-            } else
-            {
+            //if (dimensionIndex == 2 && !isUpper) {
+            //  auto returnedPosition = position;
+            //  returnedPosition[dimensionIndex] = boundaryPosition;
+            //  return returnedPosition;
+            //} else {
               const auto displacementToBoundary = boundaryPosition - position[dimensionIndex];
               auto returnedPosition = position;
               returnedPosition[dimensionIndex] += 2 * displacementToBoundary;
               return returnedPosition;
-            }
+            //}
           }();
           const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
           const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
-          const auto force = LJKernel(position, mirrorPosition, sigmaSquared, epsilon24);
+          auto force = LJKernel(position, mirrorPosition, sigmaSquared, epsilon24);
           p->addF(force);
 #endif
 
 #if MD_FLEXIBLE_MODE == MULTISITE
+
           // test if attraction has occurred
           const bool reflectionIsAttractive = isUpper ? p->getF()[dimensionIndex] - currentForce[dimensionIndex] > 0
                                                       : p->getF()[dimensionIndex] - currentForce[dimensionIndex] < 0;
@@ -585,8 +594,10 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
     if (isNearRel(_localBoxMin[dimensionIndex], _globalBoxMin[dimensionIndex])) {
       reflSkinMin = _globalBoxMin;
       reflSkinMax = _globalBoxMax;
-      reflSkinMax[dimensionIndex] = _globalBoxMin[dimensionIndex] + _maxReflectiveSkin;
-
+      // Widen the scan slab at the sine wall so crests (up to 2*amplitude above the flat plane) aren't missed.
+      const double slabThickness =
+          (dimensionIndex == 2) ? _maxReflectiveSkin + 2.0 * Amplitude : _maxReflectiveSkin;
+      reflSkinMax[dimensionIndex] = _globalBoxMin[dimensionIndex] + slabThickness;
       reflect(false);
     }
     // apply if we are at a global boundary on upper end of the dimension
@@ -599,7 +610,6 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
     }
   }
 }
-
 void RegularGridDecomposition::sendAndReceiveParticlesLeftAndRight(const std::vector<ParticleType> &particlesToLeft,
                                                                    const std::vector<ParticleType> &particlesToRight,
                                                                    std::vector<ParticleType> &receivedParticlesBuffer,
