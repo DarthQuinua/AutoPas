@@ -461,8 +461,14 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
   std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
 
   double Amplitude = 1.0;
-  int freq = 2;
+  int freq = 6;
   double wave_x_position = 2.0 * M_PI * freq / (_globalBoxMax[0] - _globalBoxMin[0]);
+  double wave_mean_height = 2.0 * Amplitude;
+
+  auto waveSLope = [&](double x)
+  {
+    return Amplitude * wave_x_position * std::cos(wave_x_position * x);
+  };
 
   for (int dimensionIndex = 0; dimensionIndex < _dimensionCount; ++dimensionIndex) {
     if (_boundaryType[dimensionIndex] != options::BoundaryTypeOption::reflective) continue;
@@ -476,16 +482,12 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
            p.isValid(); ++p) {
         const auto position = p->getR();
 
-        //////
-        if (isSineWall)
-        {
-
-        }
         const auto boundaryPosition =
-            isSineWall ? _globalBoxMin[dimensionIndex] + Amplitude * (1.0 + std::sin(wave_x_position * position[0]))
+            isSineWall ? _globalBoxMin[2] + wave_mean_height + Amplitude * std::sin(wave_x_position * position[0])
                        : flatBoundaryPosition;
 
-        const auto distanceToBoundary = std::abs(position[dimensionIndex] - boundaryPosition);
+        const auto signedDistanceToBoundary =
+          isUpper ? boundaryPosition - position[dimensionIndex] : position[dimensionIndex] - boundaryPosition;
 
         const auto LJKernel = [](const std::array<double, 3> sitePosition,
                                  const std::array<double, 3> mirrorSitePosition, const double sigmaSquared,
@@ -504,7 +506,7 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
         };
 
         const bool reflectMoleculeFlag =
-            distanceToBoundary < sixthRootOfTwo * 0.5 *
+            signedDistanceToBoundary < sixthRootOfTwo * 0.5 *
 #if MD_FLEXIBLE_MODE == MULTISITE
                                      particlePropertiesLib.getMoleculesLargestSigma(p->getTypeId());
 #else
@@ -557,22 +559,31 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
           }
 #else
           const auto siteType = p->getTypeId();
-          const auto mirrorPosition = [position, boundaryPosition, dimensionIndex, isUpper]() {
+          const auto mirrorPosition = [position, boundaryPosition, dimensionIndex, isUpper, signedDistanceToBoundary]() {
             //if (dimensionIndex == 2 && !isUpper) {
             //  auto returnedPosition = position;
             //  returnedPosition[dimensionIndex] = boundaryPosition;
             //  return returnedPosition;
             //} else {
-              const auto displacementToBoundary = boundaryPosition - position[dimensionIndex];
+              //const auto displacementToBoundary = boundaryPosition - position[dimensionIndex];
               auto returnedPosition = position;
-              returnedPosition[dimensionIndex] += 2 * displacementToBoundary;
+              double mirror_offset = (isUpper ? 1.0 : -1.0) * 2.0 * signedDistanceToBoundary;
+              //returnedPosition[dimensionIndex] += 2 * displacementToBoundary;
+              returnedPosition[dimensionIndex] += mirror_offset;
               return returnedPosition;
             //}
           }();
           const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
           const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
           auto force = LJKernel(position, mirrorPosition, sigmaSquared, epsilon24);
+
+          if (isSineWall)
+          {
+            force[0] -= waveSLope(position[0]) * force[2];
+          }
+
           p->addF(force);
+
 #endif
 
 #if MD_FLEXIBLE_MODE == MULTISITE
@@ -594,10 +605,12 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
     if (isNearRel(_localBoxMin[dimensionIndex], _globalBoxMin[dimensionIndex])) {
       reflSkinMin = _globalBoxMin;
       reflSkinMax = _globalBoxMax;
-      // Widen the scan slab at the sine wall so crests (up to 2*amplitude above the flat plane) aren't missed.
-      const double slabThickness =
-          (dimensionIndex == 2) ? _maxReflectiveSkin + 2.0 * Amplitude : _maxReflectiveSkin;
-      reflSkinMax[dimensionIndex] = _globalBoxMin[dimensionIndex] + slabThickness;
+      double max_wave_height = _globalBoxMin[2] + wave_mean_height + Amplitude;
+      //const double extra_space =
+      //    (dimensionIndex == 2) ? _maxReflectiveSkin + 2.0 * Amplitude : _maxReflectiveSkin;
+      reflSkinMax[dimensionIndex] = (dimensionIndex == 2)
+                                        ? max_wave_height + _maxReflectiveSkin
+                                        : _globalBoxMin[dimensionIndex] + _maxReflectiveSkin;
       reflect(false);
     }
     // apply if we are at a global boundary on upper end of the dimension
