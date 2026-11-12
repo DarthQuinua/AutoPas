@@ -455,6 +455,180 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries1(AutoPasType &autoPa
   }
 }
 
+void RegularGridDecomposition::reflectParticlesUsingTangent(AutoPasType &autoPasContainer,
+                                                            ParticlePropertiesLibraryType &particlePropertiesLib)
+{
+  using autopas::utils::Math::isNearRel;
+  using namespace autopas::utils::ArrayMath::literals;
+  std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
+
+  double Amplitude = 1.0;
+  int freq = 30;
+  double wave_x_position = 2.0 * M_PI * freq / (_globalBoxMax[0] - _globalBoxMin[0]);
+  double wave_mean_height = 2.0 * Amplitude;
+
+  auto waveSLope = [&](double x)
+  {
+    return Amplitude * wave_x_position * std::cos(wave_x_position * x);
+  };
+
+  auto waveSecondDerivate = [&](double x)
+  {
+    return -Amplitude * wave_x_position * wave_x_position * std::sin(wave_x_position * x);
+  };
+
+  auto get_height = [&](double x)
+  {
+    return _globalBoxMin[2] + wave_mean_height + Amplitude * std::sin(wave_x_position * x);
+  };
+
+  const double wavelength = 2.0 * M_PI / wave_x_position;
+  const double boxLengthX = _globalBoxMax[0] - _globalBoxMin[0];
+  const int numNodes = static_cast<int>(std::ceil(boxLengthX / std::min(0.1, wavelength / 64.0)));
+  const double distanceofNodes = boxLengthX / numNodes;
+  std::vector<double> nodeX(numNodes + 1);  // x Position
+  std::vector<double> nodeZ(numNodes + 1);  // Z Position
+  std::vector<double> nodeNornal(numNodes + 1); // normal vector normalized
+  std::vector<double> nodeTangent(numNodes + 1); // inverse norm of the tangent
+  for (int j = 0; j <= numNodes; ++j) {
+    const double x = _globalBoxMin[0] + j * distanceofNodes;
+    const double invnorm = 1.0 / std::sqrt(1.0 + waveSLope(x) * waveSLope(x));
+    nodeX[j] = x;
+    nodeZ[j] = get_height(x);
+    nodeNornal[j] = -waveSLope(x) * invnorm;
+    nodeTangent[j] = invnorm;
+  }
+
+  const double sineWallSkin = 2.0 * _maxReflectiveSkin;
+  const double searchRadius = 1.5 * sineWallSkin;
+
+  auto find_closest_point = [&](double px, double pz) -> double
+  {
+    const int jLo = std::max(0, static_cast<int>(std::floor((px - searchRadius - _globalBoxMin[0]) / distanceofNodes)));
+    const int jHi = std::min(numNodes, static_cast<int>(std::ceil((px + searchRadius - _globalBoxMin[0]) / distanceofNodes)));
+    int best = -1;
+    double bestD2 = searchRadius * searchRadius;
+    for (int j = jLo; j <= jHi; ++j) {
+      const double distanceX = px - nodeX[j];
+      const double distanceZ = pz - nodeZ[j];
+      const double d2 = distanceX * distanceX + distanceZ * distanceZ;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        best = j;
+      }
+    }
+    if (best < 0) return std::numeric_limits<double>::quiet_NaN();
+
+    double lo = nodeX[best] - 2.0 * distanceofNodes;
+    double hi = nodeX[best] + 2.0 * distanceofNodes;
+
+    const double tz = -nodeNornal[best];
+    const double along = (px - nodeX[best]) * nodeTangent[best] + (pz - nodeZ[best]) * tz;
+    double x = std::clamp(nodeX[best] + along * nodeTangent[best], lo, hi);
+
+    for (int it = 0; it < 50; ++it) {
+      double height_difference = get_height(x) - pz;
+      double g = (x- px) + height_difference * waveSLope(x); // slope of the squared distance
+      double dg = 1.0 + waveSLope(x) * waveSLope(x) + height_difference * waveSecondDerivate(x); // slope of g
+      double step = g / dg;
+      x -= step;
+      if (std::abs(step) < 1e-12)
+      {
+        break;
+      }
+    }
+    return x;
+  };
+
+  const auto LJKernel = [](const std::array<double, 3> sitePosition, const std::array<double, 3> mirrorSitePosition,
+                         const double sigmaSquared, const double epsilon24) {
+    const auto displacement = autopas::utils::ArrayMath::sub(sitePosition, mirrorSitePosition);
+    const auto distanceSquared = autopas::utils::ArrayMath::dot(displacement, displacement);
+
+    const auto inverseDistanceSquared = 1. / distanceSquared;
+    const auto lj2 = sigmaSquared * inverseDistanceSquared;
+    const auto lj6 = lj2 * lj2 * lj2;
+    const auto lj12 = lj6 * lj6;
+    const auto lj12m6 = lj12 - lj6;
+    const auto scalarMultiple = epsilon24 * (lj12 + lj12m6) * inverseDistanceSquared;
+
+    return autopas::utils::ArrayMath::mulScalar(displacement, scalarMultiple);
+  };
+
+  for (int dimensionIndex = 0; dimensionIndex < _dimensionCount; ++dimensionIndex)
+  {
+    if (_boundaryType[dimensionIndex] != options::BoundaryTypeOption::reflective) continue;
+
+    auto reflect = [&](bool isUpper) {
+//      bool isSineWall = false;
+      const bool isSineWall = (dimensionIndex == 2) and not isUpper;
+      const double flatBoundaryPosition = isUpper ? reflSkinMax[dimensionIndex] : reflSkinMin[dimensionIndex];
+
+      for (auto p = autoPasContainer.getRegionIterator(reflSkinMin, reflSkinMax, autopas::IteratorBehavior::owned);
+           p.isValid(); ++p) {
+        const auto position = p->getR();
+
+        if (isSineWall) {
+          double foot_x_position = find_closest_point(position[0], position[2]);
+          if (std::isnan(foot_x_position)) {
+            continue;
+          }
+
+          const double slope_at_foot = waveSLope(foot_x_position);
+          const double inverseNorm = 1.0 / std::sqrt(1.0 + slope_at_foot * slope_at_foot);
+          const std::array<double, 3> normal{-slope_at_foot * inverseNorm, 0.0, inverseNorm};
+          const std::array<double, 3> closest_point_cords{foot_x_position, position[1], get_height(foot_x_position)};
+
+          const double signedDistance = autopas::utils::ArrayMath::dot(position - closest_point_cords, normal);
+
+          const bool reflectMoleculeFlag =
+            signedDistance < sixthRootOfTwo * particlePropertiesLib.getSigma(p->getTypeId());
+
+          if (reflectMoleculeFlag)
+          {
+            const auto siteType = p->getTypeId();
+            const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
+            const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
+            const double effectiveDistance = signedDistance;
+            const std::array<double, 3> partnerPosition = position - normal * effectiveDistance;
+            p->addF(LJKernel(position, partnerPosition, sigmaSquared, epsilon24));
+          }
+        } else {
+          const double signedDistance = isUpper ? flatBoundaryPosition - position[dimensionIndex]
+                                                : position[dimensionIndex] - flatBoundaryPosition;
+          if (signedDistance < sixthRootOfTwo * 0.5 * particlePropertiesLib.getSigma(p->getTypeId())) {
+            const auto siteType = p->getTypeId();
+            const auto sigmaSquared = particlePropertiesLib.getMixingSigmaSquared(siteType, siteType);
+            const auto epsilon24 = particlePropertiesLib.getMixing24Epsilon(siteType, siteType);
+            auto mirrorPosition = position;
+            mirrorPosition[dimensionIndex] += (isUpper ? 2.0 : -2.0) * signedDistance;
+            p->addF(LJKernel(position, mirrorPosition, sigmaSquared, epsilon24));
+          }
+        }
+      }
+    };
+
+    // apply if we are at a global boundary on lower end of the dimension
+    if (isNearRel(_localBoxMin[dimensionIndex], _globalBoxMin[dimensionIndex])) {
+      reflSkinMin = _globalBoxMin;
+      reflSkinMax = _globalBoxMax;
+      const double max_wave_height = _globalBoxMin[2] + wave_mean_height + Amplitude;
+
+      reflSkinMax[dimensionIndex] = (dimensionIndex == 2) ? max_wave_height + sineWallSkin
+                                                          : _globalBoxMin[dimensionIndex] + _maxReflectiveSkin;
+      reflect(false);
+    }
+    // apply if we are at a global boundary on upper end of the dimension
+    if (isNearRel(_localBoxMax[dimensionIndex], _globalBoxMax[dimensionIndex])) {
+      reflSkinMin = _globalBoxMin;
+      reflSkinMax = _globalBoxMax;
+      reflSkinMin[dimensionIndex] = _globalBoxMax[dimensionIndex] - _maxReflectiveSkin;
+
+      reflect(true);
+    }
+  }
+}
+
 void RegularGridDecomposition::reflectParticlesPlaceParticleAtNormal(AutoPasType &autoPasContainer,
                                                             ParticlePropertiesLibraryType &particlePropertiesLib)
 {
@@ -463,7 +637,7 @@ void RegularGridDecomposition::reflectParticlesPlaceParticleAtNormal(AutoPasType
   std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
 
   double Amplitude = 1.0;
-  int freq = 5;
+  int freq = 30;
   double wave_x_position = 2.0 * M_PI * freq / (_globalBoxMax[0] - _globalBoxMin[0]);
   double wave_mean_height = 2.0 * Amplitude;
 
@@ -490,7 +664,7 @@ void RegularGridDecomposition::reflectParticlesPlaceParticleAtNormal(AutoPasType
       double height_difference = get_height(x) - pz;
       double g = (x- px) + height_difference * waveSLope(x); // slope of the squared distance
       double dg = 1.0 + waveSLope(x) * waveSLope(x) + height_difference * waveSecondDerivate(x); // slope of g
-      double step = (g / dg);
+      double step = g / dg;
       x -= step;
       if (std::abs(step) < 1e-12)
       {
@@ -553,8 +727,7 @@ void RegularGridDecomposition::reflectParticlesPlaceParticleAtNormal(AutoPasType
 
             p->addF(force);
           }
-        } else
-        {
+        } else {
           const double signedDistance = isUpper ? flatBoundaryPosition - position[dimensionIndex]
                                                 : position[dimensionIndex] - flatBoundaryPosition;
           if (signedDistance < sixthRootOfTwo * 0.5 * particlePropertiesLib.getSigma(p->getTypeId())) {
@@ -599,7 +772,7 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
 
   if (generate_particle_at_normal)
   {
-    reflectParticlesPlaceParticleAtNormal(autoPasContainer, particlePropertiesLib);
+    reflectParticlesUsingTangent(autoPasContainer, particlePropertiesLib);
     return;
   }
 
@@ -607,7 +780,7 @@ void RegularGridDecomposition::reflectParticlesAtBoundaries(AutoPasType &autoPas
   std::array<double, _dimensionCount> reflSkinMin{}, reflSkinMax{};
 
   double Amplitude = 1.0;
-  int freq = 6;
+  int freq = 10;
   double wave_x_position = 2.0 * M_PI * freq / (_globalBoxMax[0] - _globalBoxMin[0]);
   double wave_mean_height = 2.0 * Amplitude;
 

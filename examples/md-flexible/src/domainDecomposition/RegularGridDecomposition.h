@@ -138,6 +138,7 @@ class RegularGridDecomposition final : public DomainDecomposition {
   void reflectParticlesAtBoundaries1(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
   void reflectParticlesAtBoundaries(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
   void reflectParticlesPlaceParticleAtNormal(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
+  void reflectParticlesUsingTangent(AutoPasType &autoPasContainer, ParticlePropertiesLibraryType &PPL);
   /**
    * Getter for the communicator that encompasses the whole decomposition.
    * @return
